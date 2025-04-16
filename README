@@ -1,0 +1,8 @@
+Hello, I am writing to notify you of some details while testing. 
+Due to the server being very efficient on the cloudlab, we had trouble losing packets no matter how many client threads we had.
+In order to resolve this, we introduced an artificial server delay of 50 ms (usleep function call). 
+This delay is only present to present the unreliability of UDP on a busy server. 
+With this in mind, when testing, we would recommend keeping the message amount to 100 or less 
+(We tested task 1 with 100 messages, and were able to get 0 packet loss with 2 and 15 threads, 50 packets lost with 30 threads, and 70 packets lost with 50 threads.)
+This delay is also present in task 2, as we wanted to display the ability of our retransmission algorithm to ensure that there is no packet loss regardless of a busy server. 
+Once again, due to this delay, We recommend keeping the number of requests down to 100 or less (it still works with a lot of requests, but takes a lot longer.)
