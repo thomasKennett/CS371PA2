@@ -1,0 +1,478 @@
+/*
+# Copyright 2025 University of Kentucky
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+*/
+
+/* 
+Please specify the group members here
+
+# Student #1: Thomas Kennett
+# Student #2: Connor Tallent
+# Student #3: 
+
+*/
+
+#include <fcntl.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/timerfd.h>
+#include <pthread.h>
+
+#define MAX_EVENTS 64
+#define MESSAGE_SIZE 16
+#define DEFAULT_CLIENT_THREADS 4
+
+char *server_ip = "127.0.0.1";
+int server_port = 12345;
+int num_client_threads = DEFAULT_CLIENT_THREADS;
+int num_requests = 1000000;
+
+
+/*
+ * This structure is used to store per-thread data in the client
+ */
+typedef struct {
+    int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
+    int socket_fd;       /* File descriptor for the client socket connected to the server. */
+    long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
+    long total_messages; /* Total number of messages sent and received. */
+    float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages. */
+    struct sockaddr_in server_addr; //the address for the given server
+    int lostPackets; //number of lost packets
+    int totalPacketsSent; //number of packets sent
+    int tmr_fd; //timer file descriptor
+    int client_id; //id of the client thread
+    uint32_t tx_cnt; //packets sent
+    uint32_t rx_cnt; // packets recieved
+    socklen_t server_addr_len; // length of our server adress
+} client_thread_data_t;
+
+typedef struct __attribute__((packed))
+{
+    uint32_t client_id;   //thread index
+    uint32_t seq;         // sequence number
+    uint32_t tx_cnt;      // store a send counter that shouldnt increase when a retransmission occurs
+    char payload[MESSAGE_SIZE];   //16 Byte body
+} frame_t;
+
+//This function is used to create our epoll timer to look for timeouts
+int create_timerfd(void)
+{
+    //create our unblocked timer file descriptor, CLOCK_MONOTONIC is 1 here
+    int timefd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if(timefd==-1)
+    {
+        perror("timer fd creation failed");
+        exit(1);
+    }
+    return timefd;
+}
+
+static void arm_timer(int timefd, int timeout_ms)
+{
+    //define a struct to configure our timer fd.
+    struct itimerspec newValue = {0};
+    newValue.it_value.tv_sec = timeout_ms/1000;
+    //convert to nano seconds
+    newValue.it_value.tv_nsec = (timeout_ms%1000)*1000000;
+
+    if(timerfd_settime(timefd, 0, &newValue, NULL) == -1)
+    {
+        perror("Setting time");
+        exit(1);
+    }
+}
+
+/*
+ * This function runs in a separate client thread to handle communication with the server
+ */
+void *client_thread_func(void *arg) {
+    client_thread_data_t *data = (client_thread_data_t *)arg;
+    struct epoll_event event, events[MAX_EVENTS];
+    struct timeval start, end;
+    //RTT is declared as a long long in run client function, se needs to be long long in client thread
+    long long totalThreadRTT = 0;
+    int threadMessagesSent = 0;
+    int sequenceNum = 0; // sequence number for each request
+    int threadMessagesLost = 0; //Track the number of lost messages in individual threads
+    int threadMessagesReceived = 0; //Treack the number of messages recevied
+    //register the "connected" clientThread's socket in the its epoll instance
+    //dont need to set the poll_ctl to the current socket, this is handled in client setup
+    //iterate through every request within current thread
+    //make sure Flag in socket is nonblocking
+    int flags = fcntl(data->socket_fd, F_GETFL, 0);
+    fcntl(data->socket_fd, F_SETFL, flags|O_NONBLOCK);
+    for(int i = 0; i < num_requests; i++)
+    {
+        //start time measurement
+        gettimeofday(&start,NULL);
+
+        //create a new message
+        char message[MESSAGE_SIZE];
+        snprintf(message, sizeof(message),"MSG %d", sequenceNum);
+        //need to increment the sequence num were sending out
+        sequenceNum++;
+        //create a frame with proper logistics
+        frame_t fr;
+        fr.client_id = data->client_id;
+        fr.seq = sequenceNum;
+        fr.tx_cnt = ++data->tx_cnt;
+        memcpy(fr.payload, message, MESSAGE_SIZE);
+        //send message and wait for response
+        if (sendto(data->socket_fd, &fr, sizeof fr, 0,(struct sockaddr *)&data->server_addr, sizeof(data->server_addr)) < 0)
+        {
+            perror("sendto failed.");
+            threadMessagesLost++;
+            continue;
+        }
+        threadMessagesSent++;
+        //clear any previous timers
+        uint64_t exp;
+        if(read(data->tmr_fd, &exp, sizeof(exp)) < 0 && errno != EAGAIN)
+        {
+            perror("Reading the timer");
+        }
+        arm_timer(data->tmr_fd, 100);
+
+        //now lets wait for response
+        int gotResponse = 0;
+        int currTry = 0;
+        while(gotResponse==0)
+        {
+            int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 100);
+            int socketProcessFlag = 0;
+            //if our wait failed:
+            if(nfds == -1) 
+            {
+                perror("epoll_wait failed");
+                threadMessagesLost++;
+                break;
+            }
+        //iterate through ready file descriptors
+            for(int j = 0; j<nfds; j++)
+            {
+                //first, check if our event is within the timer
+                if(events[j].data.fd == data->tmr_fd)
+                {
+                    uint64_t expirations;
+                    read(data->tmr_fd, &expirations, sizeof(expirations));
+                    continue;
+                }
+                //check if our event corresponds to clients socket (basically if the event has recived data)
+                if(events[j].data.fd == data->socket_fd)
+                {
+                    //create a frame for ack
+                    frame_t ack;
+                    socklen_t addr_len = data->server_addr_len;
+                    //store recieved in received status
+                    int receivedStatus = recvfrom(data->socket_fd, &ack, sizeof(ack), 0, (struct sockaddr *)&data->server_addr, &addr_len);
+                    if(receivedStatus < 0)
+                    {
+                        perror("single thread recv");
+                    }
+                    //if we have successfully got something that could be an ack
+                    if(receivedStatus == sizeof(ack))
+                    {
+                        //double check that its the correct ack
+                        if(ack.client_id == data->client_id && ack.seq == sequenceNum)
+                        {
+                            //let the loop know weve processed an ack
+                            socketProcessFlag = 1;
+
+                            //this is for rtt calculation
+                            gettimeofday(&end,NULL);
+                            long long rtt_microseconds = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+                            //got our reply, so we can set response flag now and increment rx_cnt.
+                            gotResponse = 1;
+                            data->rx_cnt++;
+                            totalThreadRTT += rtt_microseconds;
+                            threadMessagesReceived++;
+                            //clear the timer
+                            if(read(data->tmr_fd, &exp, sizeof(exp))==-1 && errno != EAGAIN)
+                            {
+                                perror("Clearing timer after response in thread");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            //we werent able to process for whatever reason
+            if(socketProcessFlag == 0)
+            {
+                //increment try, we could implement something later to diagnose the server with this, we are not using it for anything here though.
+                currTry++;
+                //retransmission
+                if (sendto(data->socket_fd, &fr, sizeof(fr), 0, (struct sockaddr *)&data->server_addr, sizeof(data->server_addr)) == -1)
+                {
+                    perror("Retransmit sendto");
+                }
+                if (read(data->tmr_fd, &exp, sizeof(exp)) == -1 && errno != EAGAIN)
+                {
+                    perror("Retransmit read timer");
+                }
+                //re arm the timer
+                arm_timer(data->tmr_fd, 100);
+            }
+            //if weve successfully got our response, we can jumo out of the while loop
+            if(gotResponse==1) break;
+        }
+        if(gotResponse==0) threadMessagesLost++;
+    }
+
+    printf("Messages Sent: %d, Lost: %d\n", threadMessagesSent, threadMessagesLost);
+    // Update global metrics (may lead to race conditions if they access same data? Check back)
+    data->total_rtt = totalThreadRTT;
+    data->total_messages = threadMessagesSent;
+    data->request_rate = (float)threadMessagesSent / (totalThreadRTT / 1000000.0);
+    data->lostPackets = threadMessagesLost;
+    //close the socketsrtt_micro now
+    close(data->socket_fd);
+    close(data->epoll_fd);
+    close(data->tmr_fd);
+
+    return NULL;
+}
+
+/*
+ * This function orchestrates multiple client threads to send requests to a server,
+ * collect performance data of each threads, and compute aggregated metrics of all threads.
+ */
+void run_client() {
+    pthread_t threads[num_client_threads];
+    client_thread_data_t thread_data[num_client_threads];
+    struct sockaddr_in server_addr;
+
+    //need to store data for total_rtt, totalMessages, and totalRequestRate
+    //total_rtt is in microseconds, might need to use long long to play it safe
+    long long totalRTT = 0;
+    long totalMessages = 0;
+    float totalRequestRate = 0.0;
+    int totalLostPackets = 0;
+    //bind socket to server
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0)
+    {
+        perror("inet_pton");
+        exit(1);
+    }
+    //start by creating sockets and epoll instances for all threads:
+    for(int i = 0; i < num_client_threads; i++)
+    {
+        //create the socket for this thread
+        //AF_INET to specify IPV4, SOCK_DGRAM to specify UDP sockets
+        int clientSocketFD = socket(AF_INET, SOCK_DGRAM, 0);
+        if(clientSocketFD < 0)
+        {
+            perror("Client socket creation");
+            exit(1);
+        }
+        //use connect to connect the client socket to the network
+        //Create an epoll instance for the thread
+        int epollFD = epoll_create1(0);
+        if(epollFD < 0)
+        {
+            perror("client epoll_create");
+            exit(1);
+        }
+        //create a timer
+        thread_data[i].tmr_fd = create_timerfd();
+        //Register the socket with the epoll instance
+        struct epoll_event event_socket = {0}, event_timer = {0};
+        //EPOLLIN is used here because we want to be notified when there is data to read
+        event_socket.events = EPOLLIN;
+        //set the event file descriptor to our socket. This registers the client socket to the epoll instance
+        event_socket.data.fd = clientSocketFD;
+        if(epoll_ctl(epollFD, EPOLL_CTL_ADD, clientSocketFD, &event_socket))
+        {
+            perror("client epoll_ctl: add");
+            exit(1);
+        }
+
+        //lets add a timer to the thread with 100 ms.
+        event_timer.events = EPOLLIN;
+        event_timer.data.fd = thread_data[i].tmr_fd;
+        if(epoll_ctl(epollFD, EPOLL_CTL_ADD, thread_data[i].tmr_fd, &event_timer))
+        {
+            perror("client epoll_ctl: add");
+            exit(1);
+        }
+
+        // use thread_data to save the created socket and epoll instance for each thread
+        thread_data[i].socket_fd = clientSocketFD;
+        thread_data[i].epoll_fd = epollFD;
+        thread_data[i].total_rtt = 0;
+        thread_data[i].total_messages = 0;
+        thread_data[i].request_rate = 0.0;
+        thread_data[i].server_addr = server_addr;
+        thread_data[i].server_addr_len = sizeof(server_addr);
+        thread_data[i].client_id = i;
+        thread_data[i].tx_cnt = 0;
+        thread_data[i].rx_cnt = 0;
+    }
+    
+    // You will pass the thread_data to pthread_create() as below
+    for (int i = 0; i < num_client_threads; i++) {
+        pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
+    }
+
+    // Wait for client threads to complete and aggregate metrics of all client threads
+    for (int i = 0; i < num_client_threads; i++)
+    {
+        pthread_join(threads[i], NULL);
+        printf("Thread %u tx_cnt=%u rx_cnt=%u\n", thread_data[i].client_id, thread_data[i].tx_cnt,thread_data[i].rx_cnt);
+        //if recieved is the same amount of sent, this is working.
+        if(thread_data[i].tx_cnt==thread_data[i].rx_cnt)
+        {
+            printf("They are equal, no loss\n");
+        }
+        else
+        {
+            printf("They are not equal, loss experiecned");
+        }
+        //update our stats
+        totalRTT += thread_data[i].total_rtt;
+        totalMessages += thread_data[i].total_messages;
+        totalRequestRate += thread_data[i].request_rate;
+        totalLostPackets += thread_data[i].lostPackets;
+        //may need to come back and close the socket and epoll instance for the threads
+    }
+
+    if(totalMessages>0) printf("Average RTT: %lld us\n", totalRTT / totalMessages);
+    printf("Total Request Rate: %f messages/s\n", totalRequestRate);
+    printf("Total Messages Sent: %ld\n", totalMessages);
+}
+
+void run_server() {
+
+    /* TODO:
+     * Server creates listening socket and epoll instance.
+     * Server registers the listening socket to epoll
+     */
+    //create listening socket + epoll instance
+    int listeningSocketFD = socket(AF_INET, SOCK_DGRAM, 0);
+    if (listeningSocketFD < 0) 
+    {
+        perror("listening socket creation");
+        exit(1);
+    }
+    int epollFD = epoll_create1(0);
+    if (epollFD < 0) 
+    {
+        perror("server epoll_create");
+        exit(1);
+    }
+
+    //register the listening socket to epoll instance
+    //declare a struct for epoll event (declared in sys/epoll.h)
+    struct epoll_event event;
+    
+    //EPOLLIN is used here because we want to be notified when there is data to read
+    event.events = EPOLLIN;
+    //set the event file descriptor to our socket. This registers the listening socket to the epoll instance
+    event.data.fd = listeningSocketFD;
+    //Tell epoll to monitor the fd we placed in event.data.fd (the listening socket)
+    if (epoll_ctl(epollFD, EPOLL_CTL_ADD, listeningSocketFD, &event) < 0) 
+    {
+        perror("epoll_ctl: add");
+        exit(1);
+    }
+    /* Server's run-to-completion event loop */
+    // Binding
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    server_addr.sin_addr.s_addr = INADDR_ANY; // Bind to all interfaces
+
+    if (bind(listeningSocketFD, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0)
+    {
+        perror("server bind");
+        exit(1);
+    }
+
+    struct epoll_event events[MAX_EVENTS];
+    printf("Server is currently listening on %s:%d\n", server_ip, server_port);
+    while (1) {
+        /* TODO:
+         * Server uses epoll to handle connection establishment with clients
+         * or receive the message from clients and echo the message back
+         */
+        //num of file descriptors in epoll_fd
+        int nfds = epoll_wait(epollFD, events, MAX_EVENTS, -1);
+        if (nfds == -1)
+        {
+            perror("Server Socket epoll_wait");
+            exit(1);
+        }
+        for (int i = 0; i < nfds; i++)
+        {
+            //if the current event is associated with the listening socket
+            if(events[i].data.fd==listeningSocketFD && (events[i].events & EPOLLIN))
+            {
+                //we need to create a new connection for our listening socket
+                //use sock_addrin
+                //create a new frame
+                frame_t buf;
+                struct sockaddr_in clientaddr;
+                socklen_t client_len = sizeof(clientaddr);
+                ssize_t n = recvfrom(listeningSocketFD, &buf, sizeof(buf), 0, (struct sockaddr *)&clientaddr, &client_len);
+                if(n<0)
+                {
+                    perror("recvfrom serverside");
+                    continue;
+                }
+                //add server delay
+                usleep(5000);
+                //echo the packet back unchanged
+                if(sendto(listeningSocketFD, &buf, sizeof(buf), 0, (struct sockaddr *)&clientaddr, client_len)<0)
+                {
+                    perror("sendto serverside");
+                }
+            }
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc > 1 && strcmp(argv[1], "server") == 0) {
+        if (argc > 2) server_ip = argv[2];
+        if (argc > 3) server_port = atoi(argv[3]);
+
+        run_server();
+    } else if (argc > 1 && strcmp(argv[1], "client") == 0) {
+        if (argc > 2) server_ip = argv[2];
+        if (argc > 3) server_port = atoi(argv[3]);
+        if (argc > 4) num_client_threads = atoi(argv[4]);
+        if (argc > 5) num_requests = atoi(argv[5]);
+
+        run_client();
+    } else {
+        printf("Usage: %s <server|client> [server_ip server_port num_client_threads num_requests]\n", argv[0]);
+    }
+
+    return 0;
+}
